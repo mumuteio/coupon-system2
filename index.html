@@ -1,0 +1,875 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>优惠券管理系统（LeanCloud + Vercel）</title>
+
+  <!-- Tailwind Play CDN (no build step) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+</head>
+<body class="min-h-screen">
+  <div id="root"></div>
+
+  <!-- React (UMD) -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+
+  <!-- Babel (for JSX in-browser; for production建议改成构建打包) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+
+  <!-- SheetJS (XLSX) -->
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+
+  <!-- LeanCloud JS SDK -->
+  <script src="https://cdn.jsdelivr.net/npm/leancloud-storage@4.15.2/dist/av-min.js"></script>
+
+  <!--
+    你需要把下面这段配置改成你自己的 LeanCloud 信息：
+    - appId / appKey: LeanCloud 控制台 -> 应用凭证
+    - serverURL: LeanCloud 控制台 -> 应用 -> 设置 -> 服务器地址（或按地域）
+  -->
+  <script>
+    window.__LEANCLOUD__ = {
+      appId: "YOUR_APP_ID",
+      appKey: "YOUR_APP_KEY",
+      serverURL: "YOUR_SERVER_URL" // 例如：https://xxxx.leancloud.cn 或 https://xxxx.lc-cn-n1-shared.com
+    };
+  </script>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useState } = React;
+
+    const EmojiIcon = ({ label, size = 18, title }) => (
+      <span
+        title={title || label}
+        style={{
+          display: "inline-flex",
+          width: size,
+          height: size,
+          alignItems: "center",
+          justifyContent: "center",
+          fontSize: size,
+          lineHeight: 1
+        }}
+        aria-hidden="true"
+      >
+        {label}
+      </span>
+    );
+
+    function CouponSystem() {
+      const [coupons, setCoupons] = useState([]);
+      const [searchTerm, setSearchTerm] = useState("");
+      const [editingId, setEditingId] = useState(null);
+      const [sortConfig, setSortConfig] = useState({ key: null, direction: "asc" });
+      const [selectedCoupon, setSelectedCoupon] = useState("");
+      const [loading, setLoading] = useState(true);
+      const [isOnline, setIsOnline] = useState(navigator.onLine);
+      const [error, setError] = useState(null);
+
+      const [issueFormData, setIssueFormData] = useState({ issueDate: "", remarks: "" });
+      const [redeemFormData, setRedeemFormData] = useState({ redeemDate: "", remarks: "" });
+      const [formData, setFormData] = useState({ couponCode: "", issueDate: "", redeemDate: "", remarks: "" });
+
+      const lc = window.__LEANCLOUD__ || {};
+      const isLcConfigured = lc.appId && lc.appKey && lc.serverURL &&
+        !String(lc.appId).includes("YOUR_") && !String(lc.appKey).includes("YOUR_") && !String(lc.serverURL).includes("YOUR_");
+
+      const COUPON_CLASS = "Coupon"; // LeanCloud 数据表（Class）名称
+
+      const initLeanCloud = () => {
+        if (!window.AV) throw new Error("LeanCloud SDK 未加载（AV 不存在）");
+        if (!isLcConfigured) return;
+        // 避免重复 init
+        if (window.__LC_INITED__) return;
+        AV.init({ appId: lc.appId, appKey: lc.appKey, serverURL: lc.serverURL });
+        window.__LC_INITED__ = true;
+      };
+
+      const timeOf = (c) => {
+        const t = new Date(c.createdAt || 0).getTime();
+        return Number.isFinite(t) ? t : 0;
+      };
+
+      const fetchCoupons = async () => {
+        if (!isLcConfigured) {
+          setCoupons([]);
+          setLoading(false);
+          return;
+        }
+        try {
+          setError(null);
+          const query = new AV.Query(COUPON_CLASS);
+          query.limit(1000);
+          query.descending("createdAt");
+          const results = await query.find();
+          const mapped = results.map(obj => ({
+            id: obj.id,
+            couponCode: obj.get("couponCode") || "",
+            issueDate: obj.get("issueDate") || "",
+            redeemDate: obj.get("redeemDate") || "",
+            remarks: obj.get("remarks") || "",
+            createdAt: obj.createdAt ? obj.createdAt.toISOString() : "",
+            updatedAt: obj.updatedAt ? obj.updatedAt.toISOString() : ""
+          }));
+          // 保持“从旧到新”的显示习惯（你也可以改成 new->old）
+          setCoupons(mapped.reverse());
+        } catch (err) {
+          console.error("LeanCloud 读取错误:", err);
+          setError("数据加载失败: " + (err.message || String(err)));
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      useEffect(() => {
+        try {
+          initLeanCloud();
+        } catch (e) {
+          setError(e.message || String(e));
+          setLoading(false);
+          return;
+        }
+
+        setLoading(true);
+        fetchCoupons();
+
+        const handleOnline = () => setIsOnline(true);
+        const handleOffline = () => setIsOnline(false);
+        window.addEventListener("online", handleOnline);
+        window.addEventListener("offline", handleOffline);
+
+        // 简单轮询（模拟“多人协作的近实时刷新”）
+        const timer = setInterval(() => {
+          if (navigator.onLine && isLcConfigured) fetchCoupons();
+        }, 8000);
+
+        return () => {
+          clearInterval(timer);
+          window.removeEventListener("online", handleOnline);
+          window.removeEventListener("offline", handleOffline);
+        };
+      }, []);
+
+      const saveToLeanCloud = async (payload) => {
+        if (!isOnline) {
+          alert("当前网络离线，请检查网络连接");
+          return false;
+        }
+        if (!isLcConfigured) {
+          alert("LeanCloud 未配置：请先在 index.html 里填写 appId/appKey/serverURL");
+          return false;
+        }
+        try {
+          setError(null);
+          if (payload.id) {
+            const obj = AV.Object.createWithoutData(COUPON_CLASS, payload.id);
+            obj.set("couponCode", payload.couponCode || "");
+            obj.set("issueDate", payload.issueDate || "");
+            obj.set("redeemDate", payload.redeemDate || "");
+            obj.set("remarks", payload.remarks || "");
+            await obj.save();
+          } else {
+            const obj = new AV.Object(COUPON_CLASS);
+            obj.set("couponCode", payload.couponCode || "");
+            obj.set("issueDate", payload.issueDate || "");
+            obj.set("redeemDate", payload.redeemDate || "");
+            obj.set("remarks", payload.remarks || "");
+            await obj.save();
+          }
+          await fetchCoupons();
+          return true;
+        } catch (err) {
+          console.error("LeanCloud 保存失败:", err);
+          setError("保存失败: " + (err.message || String(err)));
+          return false;
+        }
+      };
+
+      const deleteFromLeanCloud = async (id) => {
+        if (!isOnline) {
+          alert("当前网络离线，请检查网络连接");
+          return false;
+        }
+        if (!isLcConfigured) {
+          alert("LeanCloud 未配置：请先在 index.html 里填写 appId/appKey/serverURL");
+          return false;
+        }
+        try {
+          setError(null);
+          const obj = AV.Object.createWithoutData(COUPON_CLASS, id);
+          await obj.destroy();
+          await fetchCoupons();
+          return true;
+        } catch (err) {
+          console.error("LeanCloud 删除失败:", err);
+          setError("删除失败: " + (err.message || String(err)));
+          return false;
+        }
+      };
+
+      const handleInputChange = (e) => {
+        setFormData({ ...formData, [e.target.name]: e.target.value });
+      };
+
+      const handleSubmit = async () => {
+        if (!formData.couponCode || !formData.issueDate) {
+          alert("请填写必填项：优惠券编号、发放日期");
+          return;
+        }
+
+        const payload = {
+          id: editingId || null,
+          couponCode: formData.couponCode,
+          issueDate: formData.issueDate,
+          redeemDate: formData.redeemDate || "",
+          remarks: formData.remarks || ""
+        };
+
+        const ok = await saveToLeanCloud(payload);
+        if (ok) {
+          setEditingId(null);
+          setFormData({ couponCode: "", issueDate: "", redeemDate: "", remarks: "" });
+        }
+      };
+
+      const handleQuickIssue = async () => {
+        if (!selectedCoupon || !issueFormData.issueDate) {
+          alert("请选择优惠券并填写发放日期");
+          return;
+        }
+
+        const couponRecords = coupons.filter(c => c.couponCode === selectedCoupon);
+        const latestRecord = couponRecords.sort((a, b) => timeOf(b) - timeOf(a))[0];
+
+        if (latestRecord && !latestRecord.redeemDate) {
+          alert(`优惠券 ${selectedCoupon} 当前在外流通中，无法发放！`);
+          return;
+        }
+
+        const ok = await saveToLeanCloud({
+          couponCode: selectedCoupon,
+          issueDate: issueFormData.issueDate,
+          redeemDate: "",
+          remarks: issueFormData.remarks || ""
+        });
+
+        if (ok) {
+          const code = selectedCoupon;
+          setSelectedCoupon("");
+          setIssueFormData({ issueDate: "", remarks: "" });
+          alert(`优惠券 ${code} 发放成功！`);
+        }
+      };
+
+      const handleQuickRedeem = async (couponCode) => {
+        if (!redeemFormData.redeemDate) {
+          alert("请填写使用日期");
+          return;
+        }
+
+        const records = coupons.filter(c => c.couponCode === couponCode);
+        const latestUnredeemed = records
+          .filter(c => c.issueDate && !c.redeemDate)
+          .sort((a, b) => timeOf(b) - timeOf(a))[0];
+
+        if (!latestUnredeemed) {
+          alert("未找到该优惠券的发放记录");
+          return;
+        }
+
+        const ok = await saveToLeanCloud({
+          id: latestUnredeemed.id,
+          couponCode: latestUnredeemed.couponCode,
+          issueDate: latestUnredeemed.issueDate,
+          redeemDate: redeemFormData.redeemDate,
+          remarks: (redeemFormData.remarks || latestUnredeemed.remarks || "")
+        });
+
+        if (ok) {
+          const code = couponCode;
+          setRedeemFormData({ redeemDate: "", remarks: "" });
+          alert(`优惠券 ${code} 回收成功！`);
+        }
+      };
+
+      const handleEdit = (coupon) => {
+        setFormData({
+          couponCode: coupon.couponCode || "",
+          issueDate: coupon.issueDate || "",
+          redeemDate: coupon.redeemDate || "",
+          remarks: coupon.remarks || ""
+        });
+        setEditingId(coupon.id);
+        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+      };
+
+      const handleDelete = async (id) => {
+        if (!window.confirm("确定要删除这条记录吗？")) return;
+        await deleteFromLeanCloud(id);
+      };
+
+      const handleCancelEdit = () => {
+        setEditingId(null);
+        setFormData({ couponCode: "", issueDate: "", redeemDate: "", remarks: "" });
+      };
+
+      const exportToExcel = () => {
+        if (!window.XLSX) {
+          alert("XLSX 库未加载，无法导出");
+          return;
+        }
+        if (coupons.length === 0) {
+          alert("没有数据可导出");
+          return;
+        }
+
+        const exportData = coupons.map(c => ({
+          "优惠券编号": c.couponCode,
+          "发放日期": c.issueDate,
+          "使用日期": c.redeemDate || "未使用",
+          "备注": c.remarks || "",
+          "创建时间": c.createdAt ? new Date(c.createdAt).toLocaleString("zh-CN") : ""
+        }));
+
+        const ws = XLSX.utils.json_to_sheet(exportData);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "优惠券记录");
+
+        const fileName = `优惠券记录_${new Date().toLocaleDateString("zh-CN").replace(/\//g, "-")}.xlsx`;
+        XLSX.writeFile(wb, fileName);
+      };
+
+      const handleSort = (key) => {
+        let direction = "asc";
+        if (sortConfig.key === key && sortConfig.direction === "asc") direction = "desc";
+        setSortConfig({ key, direction });
+      };
+
+      const getLatestByCode = (code) => {
+        const records = coupons.filter(c => c.couponCode === code).sort((a, b) => timeOf(b) - timeOf(a));
+        return records[0] || null;
+      };
+
+      const getAvailableCoupons = () => {
+        const setCodes = new Set(coupons.map(c => c.couponCode).filter(Boolean));
+        const available = [];
+        for (const code of setCodes) {
+          const latest = getLatestByCode(code);
+          if (latest && latest.redeemDate) available.push(code);
+        }
+        return available.sort();
+      };
+
+      const getIssuedNotRedeemed = () => {
+        const setCodes = new Set(coupons.map(c => c.couponCode).filter(Boolean));
+        const issued = [];
+        for (const code of setCodes) {
+          const latest = getLatestByCode(code);
+          if (latest && latest.issueDate && !latest.redeemDate) issued.push(code);
+        }
+        return issued.sort();
+      };
+
+      const filteredCoupons = useMemo(() => {
+        const q = searchTerm.trim().toLowerCase();
+        if (!q) return coupons;
+        return coupons.filter(c =>
+          (c.couponCode || "").toLowerCase().includes(q) ||
+          (c.remarks || "").toLowerCase().includes(q)
+        );
+      }, [coupons, searchTerm]);
+
+      const sortedCoupons = useMemo(() => {
+        const list = [...filteredCoupons];
+        if (!sortConfig.key) return list;
+
+        const dir = sortConfig.direction === "asc" ? 1 : -1;
+        const key = sortConfig.key;
+
+        list.sort((a, b) => {
+          const aValue = (a[key] || "").toString();
+          const bValue = (b[key] || "").toString();
+          if (aValue < bValue) return -1 * dir;
+          if (aValue > bValue) return  1 * dir;
+          return 0;
+        });
+
+        return list;
+      }, [filteredCoupons, sortConfig]);
+
+      const availableCoupons = useMemo(() => getAvailableCoupons(), [coupons]);
+      const issuedCoupons = useMemo(() => getIssuedNotRedeemed(), [coupons]);
+      const redeemedCount = useMemo(() => coupons.filter(c => c.redeemDate).length, [coupons]);
+
+      if (loading) {
+        return (
+          <div style={{
+            minHeight: "100vh",
+            background: "linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center"
+          }}>
+            <div style={{ textAlign: "center" }}>
+              <div style={{ position: "relative", display: "inline-block" }}>
+                <div style={{
+                  color: "white",
+                  animation: "spin 1s linear infinite",
+                  marginBottom: "1rem",
+                  fontSize: "48px"
+                }}>⏳</div>
+                <div style={{
+                  position: "absolute",
+                  top: 0,
+                  left: "50%",
+                  transform: "translateX(-50%)",
+                  animation: "pulse 2s infinite",
+                  fontSize: "20px"
+                }}>✨</div>
+              </div>
+              <p style={{ color: "white", fontSize: "1.25rem", fontWeight: 600 }}>正在加载数据...</p>
+              <p style={{ color: "rgba(255,255,255,0.8)", fontSize: "0.875rem", marginTop: "0.5rem" }}>
+                LeanCloud 云端同步中
+              </p>
+            </div>
+            <style>{`
+              @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+              @keyframes spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
+            `}</style>
+          </div>
+        );
+      }
+
+      return (
+        <div style={{
+          minHeight: "100vh",
+          background: "linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%)",
+          padding: "1rem"
+        }}>
+          <style>{`
+            @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+            @keyframes spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
+          `}</style>
+
+          <div className="max-w-6xl mx-auto">
+            {!isLcConfigured && (
+              <div className="mb-6 rounded-2xl border border-red-400/40 bg-red-500/20 backdrop-blur-sm p-4 text-red-100">
+                <div className="flex items-start gap-3">
+                  <div className="mt-0.5"><EmojiIcon label="⚠️" size={18} /></div>
+                  <div className="flex-1">
+                    <div className="font-semibold">LeanCloud 未配置</div>
+                    <div className="text-sm opacity-90 mt-1">
+                      请打开 <code className="bg-black/20 px-2 py-1 rounded">index.html</code>，把 <b>appId / appKey / serverURL</b> 填好再刷新页面。
+                      否则页面只能展示 UI，无法读写数据。
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="bg-white/15 backdrop-blur-xl rounded-3xl shadow-2xl p-6 md:p-8 mb-6 border border-white/20">
+              <div className="flex flex-col md:flex-row justify-between items-center gap-4 mb-6">
+                <div className="flex items-center gap-4">
+                  <div className="bg-gradient-to-br from-yellow-400 to-orange-500 p-3 rounded-2xl shadow-lg">
+                    <EmojiIcon label="✨" size={22} />
+                  </div>
+                  <div>
+                    <h1 className="text-3xl md:text-4xl font-bold text-white">优惠券管理系统</h1>
+                    <p className="text-purple-200 text-sm mt-1">LeanCloud 云端存储 · 轮询刷新（多人协作）</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  {isOnline ? (
+                    <div className="flex items-center gap-2 bg-green-500/20 backdrop-blur-sm border border-green-400/30 text-green-100 px-4 py-2 rounded-full shadow-lg">
+                      <EmojiIcon label="📶" size={16} />
+                      <span className="text-sm font-medium">在线</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2 bg-red-500/20 backdrop-blur-sm border border-red-400/30 text-red-100 px-4 py-2 rounded-full shadow-lg">
+                      <EmojiIcon label="🚫" size={16} />
+                      <span className="text-sm font-medium">离线</span>
+                    </div>
+                  )}
+                  <button
+                    onClick={() => fetchCoupons()}
+                    className="bg-white/20 hover:bg-white/30 border border-white/30 text-white px-4 py-2 rounded-full shadow-lg transition"
+                    title="手动刷新"
+                  >
+                    <span className="flex items-center gap-2">
+                      <EmojiIcon label="🔄" size={16} /> 刷新
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              {error && (
+                <div className="bg-red-500/20 backdrop-blur-sm border border-red-400/30 text-red-100 px-4 py-3 rounded-2xl mb-6 flex justify-between items-center">
+                  <span>{error}</span>
+                  <button onClick={() => setError(null)} className="text-red-200 hover:text-white transition-colors">
+                    <EmojiIcon label="✖️" size={14} />
+                  </button>
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="bg-gradient-to-br from-blue-500 to-cyan-600 p-5 rounded-2xl shadow-xl transform hover:scale-105 transition-all duration-300">
+                  <div className="flex justify-between items-start mb-3">
+                    <div className="text-blue-100 text-sm font-medium">总记录</div>
+                    <EmojiIcon label="📈" size={16} />
+                  </div>
+                  <div className="text-4xl font-bold text-white">{coupons.length}</div>
+                </div>
+                <div className="bg-gradient-to-br from-yellow-500 to-orange-600 p-5 rounded-2xl shadow-xl transform hover:scale-105 transition-all duration-300">
+                  <div className="flex justify-between items-start mb-3">
+                    <div className="text-yellow-100 text-sm font-medium">流通中</div>
+                    <EmojiIcon label="📤" size={16} />
+                  </div>
+                  <div className="text-4xl font-bold text-white">{issuedCoupons.length}</div>
+                </div>
+                <div className="bg-gradient-to-br from-green-500 to-emerald-600 p-5 rounded-2xl shadow-xl transform hover:scale-105 transition-all duration-300">
+                  <div className="flex justify-between items-start mb-3">
+                    <div className="text-green-100 text-sm font-medium">可发放</div>
+                    <EmojiIcon label="✨" size={16} />
+                  </div>
+                  <div className="text-4xl font-bold text-white">{availableCoupons.length}</div>
+                </div>
+                <div className="bg-gradient-to-br from-purple-500 to-pink-600 p-5 rounded-2xl shadow-xl transform hover:scale-105 transition-all duration-300">
+                  <div className="flex justify-between items-start mb-3">
+                    <div className="text-purple-100 text-sm font-medium">已回收</div>
+                    <EmojiIcon label="🔄" size={16} />
+                  </div>
+                  <div className="text-4xl font-bold text-white">{redeemedCount}</div>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-gradient-to-br from-green-500/20 to-emerald-600/20 backdrop-blur-xl rounded-3xl shadow-2xl p-6 md:p-8 mb-6 border border-green-400/30">
+              <h2 className="text-2xl font-bold text-white mb-6 flex items-center gap-3">
+                <div className="bg-green-500 p-2 rounded-xl"><EmojiIcon label="📤" size={18} /></div>
+                快捷发放优惠券
+              </h2>
+
+              {availableCoupons.length > 0 ? (
+                <>
+                  <div className="mb-6">
+                    <label className="block text-green-100 text-sm font-medium mb-3">选择可发放的优惠券</label>
+                    <div className="flex flex-wrap gap-3">
+                      {availableCoupons.map(code => (
+                        <button
+                          key={code}
+                          onClick={() => setSelectedCoupon(code)}
+                          className={`px-6 py-3 rounded-xl font-semibold transition-all duration-300 ${
+                            selectedCoupon === code
+                              ? "bg-white text-green-600 shadow-2xl scale-110"
+                              : "bg-green-500/30 backdrop-blur-sm text-white hover:bg-green-500/50 border border-green-400/30"
+                          }`}
+                        >
+                          {code}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {selectedCoupon && (
+                    <div className="bg-white/10 backdrop-blur-xl p-6 rounded-2xl border border-white/20">
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                        <div>
+                          <label className="block text-white text-sm font-medium mb-2">已选优惠券</label>
+                          <input
+                            type="text"
+                            value={selectedCoupon}
+                            disabled
+                            className="w-full px-4 py-3 rounded-xl bg-white/20 backdrop-blur-sm border border-white/30 text-white font-bold"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-white text-sm font-medium mb-2">发放日期 *</label>
+                          <input
+                            type="date"
+                            value={issueFormData.issueDate}
+                            onChange={(e) => setIssueFormData({ ...issueFormData, issueDate: e.target.value })}
+                            className="w-full px-4 py-3 rounded-xl bg-white/90 border-0 focus:ring-2 focus:ring-green-400"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-white text-sm font-medium mb-2">备注信息</label>
+                          <input
+                            type="text"
+                            value={issueFormData.remarks}
+                            onChange={(e) => setIssueFormData({ ...issueFormData, remarks: e.target.value })}
+                            placeholder="姓名、电话等"
+                            className="w-full px-4 py-3 rounded-xl bg-white/90 border-0 focus:ring-2 focus:ring-green-400"
+                          />
+                        </div>
+                      </div>
+                      <button
+                        onClick={handleQuickIssue}
+                        disabled={!isOnline}
+                        className="w-full bg-gradient-to-r from-green-500 to-emerald-600 text-white px-6 py-4 rounded-xl hover:from-green-600 hover:to-emerald-700 transition-all font-semibold text-lg flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed shadow-xl"
+                      >
+                        <EmojiIcon label="📤" size={18} />
+                        确认发放优惠券
+                      </button>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="text-center text-green-100 py-8 bg-white/5 rounded-2xl">
+                  <p className="text-lg">暂无可发放的优惠券</p>
+                  <p className="text-sm text-green-200 mt-2">（需要“发放后再回收”一次，才会进入可发放列表）</p>
+                </div>
+              )}
+            </div>
+
+            {issuedCoupons.length > 0 && (
+              <div className="bg-gradient-to-br from-yellow-500/20 to-orange-600/20 backdrop-blur-xl rounded-3xl shadow-2xl p-6 md:p-8 mb-6 border border-yellow-400/30">
+                <h2 className="text-2xl font-bold text-white mb-6 flex items-center gap-3">
+                  <div className="bg-yellow-500 p-2 rounded-xl"><EmojiIcon label="🔄" size={18} /></div>
+                  快捷回收优惠券
+                </h2>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                  <div>
+                    <label className="block text-white text-sm font-medium mb-2">使用日期 *</label>
+                    <input
+                      type="date"
+                      value={redeemFormData.redeemDate}
+                      onChange={(e) => setRedeemFormData({ ...redeemFormData, redeemDate: e.target.value })}
+                      className="w-full px-4 py-3 rounded-xl bg-white/90 border-0 focus:ring-2 focus:ring-yellow-400"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-white text-sm font-medium mb-2">备注信息（可选）</label>
+                    <input
+                      type="text"
+                      value={redeemFormData.remarks}
+                      onChange={(e) => setRedeemFormData({ ...redeemFormData, remarks: e.target.value })}
+                      placeholder="补充备注"
+                      className="w-full px-4 py-3 rounded-xl bg-white/90 border-0 focus:ring-2 focus:ring-yellow-400"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-3">
+                  {issuedCoupons.map(code => (
+                    <button
+                      key={code}
+                      onClick={() => handleQuickRedeem(code)}
+                      disabled={!isOnline}
+                      className="bg-white/20 backdrop-blur-sm border border-yellow-400/30 text-white px-6 py-3 rounded-xl font-semibold hover:bg-white/30 transition-all flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <EmojiIcon label="🔄" size={16} />
+                      {code}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="bg-white/10 backdrop-blur-xl rounded-3xl shadow-2xl p-6 md:p-8 border border-white/20">
+              <div className="flex flex-col md:flex-row justify-between items-center gap-4 mb-6">
+                <div className="relative w-full md:w-96">
+                  <div className="absolute left-4 top-1/2 -translate-y-1/2 text-purple-300">
+                    <EmojiIcon label="🔍" size={16} />
+                  </div>
+                  <input
+                    type="text"
+                    placeholder="搜索优惠券编号或备注..."
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                    className="w-full pl-12 pr-4 py-3 bg-white/90 rounded-xl border-0 focus:ring-2 focus:ring-purple-400 text-gray-800"
+                  />
+                </div>
+
+                <button
+                  onClick={exportToExcel}
+                  className="flex items-center gap-2 bg-gradient-to-r from-emerald-500 to-teal-600 text-white px-6 py-3 rounded-xl hover:from-emerald-600 hover:to-teal-700 transition-all font-semibold shadow-xl w-full md:w-auto"
+                >
+                  <EmojiIcon label="⬇️" size={16} />
+                  导出Excel
+                </button>
+              </div>
+
+              <div className="overflow-x-auto rounded-2xl">
+                <table className="w-full">
+                  <thead className="bg-white/20 backdrop-blur-sm">
+                    <tr>
+                      <th
+                        className="px-6 py-4 text-left text-sm font-semibold text-white cursor-pointer hover:bg-white/30 transition-colors"
+                        onClick={() => handleSort("couponCode")}
+                      >
+                        <div className="flex items-center gap-2">
+                          优惠券编号 <EmojiIcon label="↕️" size={14} />
+                        </div>
+                      </th>
+                      <th
+                        className="px-6 py-4 text-left text-sm font-semibold text-white cursor-pointer hover:bg-white/30 transition-colors"
+                        onClick={() => handleSort("issueDate")}
+                      >
+                        <div className="flex items-center gap-2">
+                          发放日期 <EmojiIcon label="↕️" size={14} />
+                        </div>
+                      </th>
+                      <th
+                        className="px-6 py-4 text-left text-sm font-semibold text-white cursor-pointer hover:bg-white/30 transition-colors"
+                        onClick={() => handleSort("redeemDate")}
+                      >
+                        <div className="flex items-center gap-2">
+                          使用日期 <EmojiIcon label="↕️" size={14} />
+                        </div>
+                      </th>
+                      <th className="px-6 py-4 text-left text-sm font-semibold text-white">状态</th>
+                      <th className="px-6 py-4 text-left text-sm font-semibold text-white">备注</th>
+                      <th className="px-6 py-4 text-left text-sm font-semibold text-white">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/10">
+                    {sortedCoupons.length === 0 ? (
+                      <tr>
+                        <td colSpan="6" className="px-6 py-12 text-center text-purple-200">
+                          <p className="text-lg">暂无数据</p>
+                          <p className="text-sm mt-2">请添加优惠券记录</p>
+                        </td>
+                      </tr>
+                    ) : (
+                      sortedCoupons.map((coupon) => (
+                        <tr key={coupon.id} className="hover:bg-white/10 transition-colors">
+                          <td className="px-6 py-4 text-sm font-semibold text-white">{coupon.couponCode}</td>
+                          <td className="px-6 py-4 text-sm text-purple-100">{coupon.issueDate}</td>
+                          <td className="px-6 py-4 text-sm text-purple-100">{coupon.redeemDate || "-"}</td>
+                          <td className="px-6 py-4 text-sm">
+                            <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
+                              coupon.redeemDate
+                                ? "bg-green-500/30 text-green-100 border border-green-400/50"
+                                : "bg-yellow-500/30 text-yellow-100 border border-yellow-400/50"
+                            }`}>
+                              {coupon.redeemDate ? "已使用" : "流通中"}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 text-sm text-purple-100">{coupon.remarks || "-"}</td>
+                          <td className="px-6 py-4 text-sm">
+                            <div className="flex gap-2">
+                              <button
+                                onClick={() => handleEdit(coupon)}
+                                className="bg-blue-500/30 backdrop-blur-sm border border-blue-400/50 text-blue-100 hover:bg-blue-500/50 p-2 rounded-lg transition-all"
+                                title="编辑"
+                              >
+                                <EmojiIcon label="✏️" size={16} />
+                              </button>
+                              <button
+                                onClick={() => handleDelete(coupon.id)}
+                                disabled={!isOnline}
+                                className="bg-red-500/30 backdrop-blur-sm border border-red-400/50 text-red-100 hover:bg-red-500/50 p-2 rounded-lg transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                                title="删除"
+                              >
+                                <EmojiIcon label="🗑️" size={16} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="bg-gradient-to-br from-purple-500/20 to-pink-600/20 backdrop-blur-xl rounded-3xl shadow-2xl p-6 md:p-8 mt-6 border border-purple-400/30">
+              <h2 className="text-2xl font-bold text-white mb-6 flex items-center gap-3">
+                <div className="bg-purple-500 p-2 rounded-xl"><EmojiIcon label="➕" size={18} /></div>
+                手动录入优惠券记录
+              </h2>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                <div>
+                  <label className="block text-white text-sm font-medium mb-2">优惠券编号 *</label>
+                  <input
+                    type="text"
+                    name="couponCode"
+                    value={formData.couponCode}
+                    onChange={handleInputChange}
+                    className="w-full px-4 py-3 rounded-xl bg-white/90 border-0 focus:ring-2 focus:ring-purple-400"
+                    placeholder="输入优惠券编号"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-white text-sm font-medium mb-2">发放日期 *</label>
+                  <input
+                    type="date"
+                    name="issueDate"
+                    value={formData.issueDate}
+                    onChange={handleInputChange}
+                    className="w-full px-4 py-3 rounded-xl bg-white/90 border-0 focus:ring-2 focus:ring-purple-400"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-white text-sm font-medium mb-2">使用日期</label>
+                  <input
+                    type="date"
+                    name="redeemDate"
+                    value={formData.redeemDate}
+                    onChange={handleInputChange}
+                    className="w-full px-4 py-3 rounded-xl bg-white/90 border-0 focus:ring-2 focus:ring-purple-400"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-white text-sm font-medium mb-2">备注信息</label>
+                  <input
+                    type="text"
+                    name="remarks"
+                    value={formData.remarks}
+                    onChange={handleInputChange}
+                    className="w-full px-4 py-3 rounded-xl bg-white/90 border-0 focus:ring-2 focus:ring-purple-400"
+                    placeholder="姓名、电话等"
+                  />
+                </div>
+              </div>
+
+              <div className="flex gap-3 flex-wrap">
+                <button
+                  onClick={handleSubmit}
+                  disabled={!isOnline}
+                  className="flex items-center gap-2 bg-gradient-to-r from-blue-500 to-indigo-600 text-white px-8 py-3 rounded-xl hover:from-blue-600 hover:to-indigo-700 transition-all font-semibold shadow-xl disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {editingId ? (
+                    <>
+                      <EmojiIcon label="💾" size={16} /> 更新记录
+                    </>
+                  ) : (
+                    <>
+                      <EmojiIcon label="➕" size={16} /> 添加记录
+                    </>
+                  )}
+                </button>
+
+                {editingId && (
+                  <button
+                    onClick={handleCancelEdit}
+                    className="flex items-center gap-2 bg-white/20 backdrop-blur-sm border border-white/30 text-white px-8 py-3 rounded-xl hover:bg-white/30 transition-all font-semibold"
+                  >
+                    <EmojiIcon label="✖️" size={14} /> 取消
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="mt-6 bg-white/5 backdrop-blur-sm rounded-2xl p-4 border border-white/10 text-center">
+              <p className="text-purple-200 text-sm">
+                ✨ 数据存储在 LeanCloud · 页面会每 8 秒自动刷新一次（也可右上角手动刷新）
+              </p>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<CouponSystem />);
+  </script>
+</body>
+</html>
